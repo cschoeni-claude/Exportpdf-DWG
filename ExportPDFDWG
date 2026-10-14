@@ -1,0 +1,205 @@
+# -*- coding: utf-8 -*-
+# Plan-Export PDF + DWG (Revit 2027 / Dynamo 4.x / CPython3)
+# IN[0] Plaene (nicht verbunden = in Revit markierte Plaene)
+# IN[1] Zielordner-Override (leer = Projektparameter 'Planspeicherort - PDF' / '- DWG') | IN[2] PDF (bool) | IN[3] DWG (bool)
+# IN[4] DWG-Setup-Name (leer = Standard) | IN[5] Dateiname-Vorlage {Nr} {Name}
+import clr
+import os
+import re
+import shutil
+import datetime
+
+clr.AddReference("RevitAPI")
+clr.AddReference("RevitAPIUI")
+clr.AddReference("RevitServices")
+from System.Collections.Generic import List
+from Autodesk.Revit import DB
+from Autodesk.Revit import UI
+from RevitServices.Persistence import DocumentManager
+
+doc = DocumentManager.Instance.CurrentDBDocument
+
+sheets_in = IN[0]
+if sheets_in is None:
+    uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument
+    sheets_in = [doc.GetElement(i) for i in uidoc.Selection.GetElementIds()]
+folder_override = IN[1]
+do_pdf = bool(IN[2])
+do_dwg = bool(IN[3])
+dwg_setup = IN[4] if len(IN) > 4 else ""
+name_tpl = IN[5] if len(IN) > 5 and IN[5] else "{Nr} - {Name}"
+
+
+def flatten(x):
+    if isinstance(x, (list, tuple)):
+        for i in x:
+            for j in flatten(i):
+                yield j
+    else:
+        yield x
+
+
+def safe_name(text):
+    return re.sub(r'[\\/:*?"<>|]', "_", text).strip()
+
+
+def build_dwg_options():
+    opts = None
+    if dwg_setup:
+        if dwg_setup in DB.DWGExportOptions.GetPredefinedSetupNames(doc):
+            opts = DB.DWGExportOptions.GetPredefinedOptions(doc, dwg_setup)
+        else:
+            raise Exception("DWG-Setup '{0}' nicht gefunden.".format(dwg_setup))
+    if opts is None:
+        opts = DB.DWGExportOptions()
+    opts.MergedViews = True
+    return opts
+
+
+def build_pdf_options(file_name):
+    o = DB.PDFExportOptions()
+    o.Combine = True
+    o.FileName = file_name
+    o.PaperFormat = DB.ExportPaperFormat.Default
+    o.ZoomType = DB.ZoomType.Zoom
+    o.ZoomPercentage = 100
+    o.HideCropBoundaries = True
+    o.HideReferencePlane = True
+    o.HideScopeBoxes = True
+    o.HideUnreferencedViewTags = True
+    o.ViewLinksInBlue = False
+    o.MaskCoincidentLines = False
+    o.ReplaceHalftoneWithThinLines = False
+    o.StopOnError = False
+    return o
+
+
+def param_path(name):
+    p = doc.ProjectInformation.LookupParameter(name)
+    if p is not None and p.HasValue:
+        v = p.AsString()
+        if v and v.strip():
+            return v.strip().strip('"')
+    return None
+
+
+log = []
+
+pdf_folder = folder_override or param_path("Planspeicherort - PDF")
+dwg_folder = folder_override or param_path("Planspeicherort - DWG")
+
+if do_pdf and not pdf_folder:
+    log.append("FEHLER: Projektparameter 'Planspeicherort - PDF' fehlt oder ist leer - PDF-Export übersprungen.")
+    do_pdf = False
+if do_dwg and not dwg_folder:
+    log.append("FEHLER: Projektparameter 'Planspeicherort - DWG' fehlt oder ist leer - DWG-Export übersprungen.")
+    do_dwg = False
+
+for f in (pdf_folder if do_pdf else None, dwg_folder if do_dwg else None):
+    if f and not os.path.isdir(f):
+        os.makedirs(f)
+
+sheets = []
+for e in flatten(sheets_in):
+    e = UnwrapElement(e)
+    if isinstance(e, DB.ViewSheet):
+        sheets.append(e)
+    else:
+        log.append("Übersprungen (kein Plan): {0}".format(getattr(e, "Name", e)))
+
+dwg_opts = build_dwg_options() if (do_dwg and sheets) else None
+
+plan = [(sh, safe_name(name_tpl.format(Nr=sh.SheetNumber, Name=sh.Name))) for sh in sheets]
+
+existing = []
+for sh, base in plan:
+    if do_pdf and os.path.isfile(os.path.join(pdf_folder, base + ".pdf")):
+        existing.append(base + ".pdf")
+    if do_dwg and os.path.isfile(os.path.join(dwg_folder, base + ".dwg")):
+        existing.append(base + ".dwg")
+
+mode = "replace"
+if existing:
+    td = UI.TaskDialog("Plan-Export")
+    td.MainInstruction = "{0} Datei(en) existieren bereits am Speicherort.".format(len(existing))
+    td.MainContent = "\n".join(existing[:15]) + ("\n..." if len(existing) > 15 else "")
+    td.AddCommandLink(UI.TaskDialogCommandLinkId.CommandLink1, "Archivieren und neu exportieren",
+                      "Alte Datei wird nach _alt verschoben (mit Änderungsdatum im Namen).")
+    td.AddCommandLink(UI.TaskDialogCommandLinkId.CommandLink2, "Ersetzen",
+                      "Vorhandene Dateien werden überschrieben.")
+    td.AddCommandLink(UI.TaskDialogCommandLinkId.CommandLink3, "Vorhandene überspringen",
+                      "Nur Pläne exportieren, die noch nicht vorhanden sind.")
+    td.CommonButtons = UI.TaskDialogCommonButtons.Cancel
+    td.DefaultButton = UI.TaskDialogResult.CommandLink1
+    res = td.Show()
+    if res == UI.TaskDialogResult.CommandLink1:
+        mode = "archive"
+    elif res == UI.TaskDialogResult.CommandLink2:
+        mode = "replace"
+    elif res == UI.TaskDialogResult.CommandLink3:
+        mode = "skip"
+    else:
+        mode = "cancel"
+        plan = []
+        do_pdf = do_dwg = False
+        log.append("Export vom Benutzer abgebrochen.")
+
+
+def prepare_target(folder, filename):
+    path = os.path.join(folder, filename)
+    if not os.path.isfile(path):
+        return True
+    if mode == "skip":
+        log.append("Übersprungen (vorhanden): {0}".format(filename))
+        return False
+    if mode == "archive":
+        try:
+            arch = os.path.join(folder, "_alt")
+            if not os.path.isdir(arch):
+                os.makedirs(arch)
+            stamp = datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y%m%d_%H%M%S")
+            stem, ext = os.path.splitext(filename)
+            dest = os.path.join(arch, "{0}_{1}{2}".format(stem, stamp, ext))
+            n = 1
+            while os.path.exists(dest):
+                dest = os.path.join(arch, "{0}_{1}_{2}{3}".format(stem, stamp, n, ext))
+                n += 1
+            shutil.move(path, dest)
+            log.append("Archiviert: {0}".format(filename))
+        except Exception as ex:
+            log.append("ARCHIVIERUNG FEHLER {0}: {1}".format(filename, ex))
+            return False
+    return True
+
+
+for sh, base in plan:
+    ids = List[DB.ElementId]()
+    ids.Add(sh.Id)
+
+    if do_pdf and prepare_target(pdf_folder, base + ".pdf"):
+        try:
+            ok = doc.Export(pdf_folder, ids, build_pdf_options(base))
+            log.append("PDF {0}: {1}".format("OK" if ok else "FEHLGESCHLAGEN", base))
+        except Exception as ex:
+            log.append("PDF FEHLER {0}: {1}".format(base, ex))
+
+    if do_dwg and prepare_target(dwg_folder, base + ".dwg"):
+        try:
+            ok = doc.Export(dwg_folder, base, ids, dwg_opts)
+            log.append("DWG {0}: {1}".format("OK" if ok else "FEHLGESCHLAGEN", base))
+        except Exception as ex:
+            log.append("DWG FEHLER {0}: {1}".format(base, ex))
+
+if do_dwg:
+    geloescht = 0
+    for fn in os.listdir(dwg_folder):
+        if fn.lower().endswith(".pcp"):
+            try:
+                os.remove(os.path.join(dwg_folder, fn))
+                geloescht += 1
+            except Exception as ex:
+                log.append("PCP nicht löschbar {0}: {1}".format(fn, ex))
+    log.append("{0} .pcp-Datei(en) im DWG-Ordner gelöscht.".format(geloescht))
+
+log.append("Fertig:{0} Pläne verarbeitet. PDF -> {1} | DWG -> {2}".format(len(sheets), pdf_folder if do_pdf else "-", dwg_folder if do_dwg else "-"))
+OUT = log
