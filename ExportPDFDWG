@@ -2,7 +2,7 @@
 # Plan-Export PDF + DWG (Revit 2027 / Dynamo 4.x / CPython3)
 # IN[0] Plaene (nicht verbunden = in Revit markierte Plaene)
 # IN[1] Zielordner-Override (leer = Projektparameter 'Planspeicherort - PDF' / '- DWG') | IN[2] PDF (bool) | IN[3] DWG (bool)
-# IN[4] DWG-Setup-Name (leer = Standard) | IN[5] Dateiname-Vorlage {Nr} {Name}
+# IN[4] DWG-Setup-Name (leer = Auswahldialog beim Export) | IN[5] Dateiname-Vorlage {Nr} {Name}
 import clr
 import os
 import re
@@ -41,6 +41,70 @@ def flatten(x):
 
 def safe_name(text):
     return re.sub(r'[\\/:*?"<>|]', "_", text).strip()
+
+
+DEFAULT_LABEL = "<Standard (ohne Voreinstellung)>"
+
+
+def choose_dwg_setup():
+    """Auswahldialog fuer die DWG-Exportvoreinstellung. Gibt (ok, name) zurueck;
+    name = "" bedeutet Standard-Optionen."""
+    clr.AddReference("System.Windows.Forms")
+    clr.AddReference("System.Drawing")
+    import System.Windows.Forms as WF
+    import System.Drawing as SD
+
+    names = sorted(DB.DWGExportOptions.GetPredefinedSetupNames(doc), key=lambda s: s.lower())
+    if not names:
+        return True, ""
+
+    form = WF.Form()
+    form.Text = "DWG-Exportvoreinstellung"
+    form.StartPosition = WF.FormStartPosition.CenterScreen
+    form.FormBorderStyle = WF.FormBorderStyle.FixedDialog
+    form.MaximizeBox = False
+    form.MinimizeBox = False
+    form.ClientSize = SD.Size(360, 130)
+    form.TopMost = True
+    form.ShowInTaskbar = True
+
+    lbl = WF.Label()
+    lbl.Text = "Welche DWG-Exportvoreinstellung soll verwendet werden?"
+    lbl.Location = SD.Point(12, 12)
+    lbl.Size = SD.Size(336, 20)
+    form.Controls.Add(lbl)
+
+    cb = WF.ComboBox()
+    cb.DropDownStyle = WF.ComboBoxStyle.DropDownList
+    cb.Location = SD.Point(12, 40)
+    cb.Size = SD.Size(336, 24)
+    cb.Items.Add(DEFAULT_LABEL)
+    for n in names:
+        cb.Items.Add(n)
+    cb.SelectedIndex = 0
+    form.Controls.Add(cb)
+
+    ok_btn = WF.Button()
+    ok_btn.Text = "OK"
+    ok_btn.DialogResult = WF.DialogResult.OK
+    ok_btn.Location = SD.Point(192, 90)
+    form.Controls.Add(ok_btn)
+
+    cancel_btn = WF.Button()
+    cancel_btn.Text = "Abbrechen"
+    cancel_btn.DialogResult = WF.DialogResult.Cancel
+    cancel_btn.Location = SD.Point(273, 90)
+    form.Controls.Add(cancel_btn)
+
+    form.AcceptButton = ok_btn
+    form.CancelButton = cancel_btn
+
+    result = form.ShowDialog()
+    selected = cb.SelectedItem
+    form.Dispose()
+    if result != WF.DialogResult.OK:
+        return False, ""
+    return True, ("" if selected == DEFAULT_LABEL else str(selected))
 
 
 def build_dwg_options():
@@ -106,6 +170,22 @@ for e in flatten(sheets_in):
         sheets.append(e)
     else:
         log.append("Übersprungen (kein Plan): {0}".format(getattr(e, "Name", e)))
+
+log.append("Diagnose: {0} Plan/Pläne erkannt | PDF={1} | DWG={2} | DWG-Setup='{3}'".format(len(sheets), do_pdf, do_dwg, dwg_setup))
+if not sheets:
+    log.append("FEHLER: Keine Pläne erkannt - IN[0] verbinden oder Pläne in Revit markieren.")
+
+if do_dwg and sheets and not dwg_setup:
+    try:
+        ok_sel, dwg_setup = choose_dwg_setup()
+    except Exception as ex:
+        ok_sel, dwg_setup = True, ""
+        log.append("Auswahldialog nicht verfügbar ({0}) - Standard-Optionen werden verwendet.".format(ex))
+    if not ok_sel:
+        do_dwg = False
+        log.append("DWG-Export abgebrochen (keine Voreinstellung gewählt).")
+    else:
+        log.append("DWG-Voreinstellung: {0}".format(dwg_setup or "Standard"))
 
 dwg_opts = build_dwg_options() if (do_dwg and sheets) else None
 
