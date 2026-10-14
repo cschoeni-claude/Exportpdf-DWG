@@ -171,6 +171,10 @@ for e in flatten(sheets_in):
     else:
         log.append("Übersprungen (kein Plan): {0}".format(getattr(e, "Name", e)))
 
+log.append("Diagnose: {0} Plan/Pläne erkannt | PDF={1} | DWG={2} | DWG-Setup='{3}'".format(len(sheets), do_pdf, do_dwg, dwg_setup))
+if not sheets:
+    log.append("FEHLER: Keine Pläne erkannt - IN[0] verbinden oder Pläne in Revit markieren.")
+
 if do_dwg and sheets and not dwg_setup:
     try:
         ok_sel, dwg_setup = choose_dwg_setup()
