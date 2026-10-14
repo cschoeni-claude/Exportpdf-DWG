@@ -65,6 +65,8 @@ def choose_dwg_setup():
     form.MaximizeBox = False
     form.MinimizeBox = False
     form.ClientSize = SD.Size(360, 130)
+    form.TopMost = True
+    form.ShowInTaskbar = True
 
     lbl = WF.Label()
     lbl.Text = "Welche DWG-Exportvoreinstellung soll verwendet werden?"
@@ -170,7 +172,11 @@ for e in flatten(sheets_in):
         log.append("Übersprungen (kein Plan): {0}".format(getattr(e, "Name", e)))
 
 if do_dwg and sheets and not dwg_setup:
-    ok_sel, dwg_setup = choose_dwg_setup()
+    try:
+        ok_sel, dwg_setup = choose_dwg_setup()
+    except Exception as ex:
+        ok_sel, dwg_setup = True, ""
+        log.append("Auswahldialog nicht verfügbar ({0}) - Standard-Optionen werden verwendet.".format(ex))
     if not ok_sel:
         do_dwg = False
         log.append("DWG-Export abgebrochen (keine Voreinstellung gewählt).")
