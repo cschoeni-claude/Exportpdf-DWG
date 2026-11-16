@@ -1,0 +1,344 @@
+{
+  "Uuid": "3f6c1a52-8b1e-4d5a-9c0e-7a2b4e6d1f10",
+  "IsCustomNode": false,
+  "Description": "Exportiert Plaene als PDF und DWG",
+  "Name": "Plan_Export_PDF_DWG",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\n# Plan-Export PDF + DWG (Revit 2027 / Dynamo 4.x / CPython3)\n# IN[0] Plaene (nicht verbunden = in Revit markierte Plaene)\n# IN[1] Zielordner-Override (leer = 'Speichern unter'-Fenster zur freien Wahl des Speicherorts) | IN[2] PDF (bool) | IN[3] DWG (bool)\n# IN[4] DWG-Setup-Name (leer = Standard) | IN[5] Dateiname-Vorlage {Nr} {Name}\nimport clr\nimport os\nimport re\nimport shutil\nimport datetime\n\nclr.AddReference(\"RevitAPI\")\nclr.AddReference(\"RevitAPIUI\")\nclr.AddReference(\"RevitServices\")\nfrom System.Collections.Generic import List\nfrom Autodesk.Revit import DB\nfrom Autodesk.Revit import UI\nfrom RevitServices.Persistence import DocumentManager\n\ndoc = DocumentManager.Instance.CurrentDBDocument\n\nsheets_in = IN[0]\nif sheets_in is None:\n    uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument\n    sheets_in = [doc.GetElement(i) for i in uidoc.Selection.GetElementIds()]\nfolder_override = IN[1]\ndo_pdf = bool(IN[2])\ndo_dwg = bool(IN[3])\ndwg_setup = IN[4] if len(IN) > 4 else \"\"\nname_tpl = IN[5] if len(IN) > 5 and IN[5] else \"{Nr} - {Name}\"\n\n\ndef flatten(x):\n    if isinstance(x, (list, tuple)):\n        for i in x:\n            for j in flatten(i):\n                yield j\n    else:\n        yield x\n\n\ndef safe_name(text):\n    return re.sub(r'[\\\\/:*?\"<>|]', \"_\", text).strip()\n\n\ndef build_dwg_options():\n    opts = None\n    if dwg_setup:\n        if dwg_setup in DB.DWGExportOptions.GetPredefinedSetupNames(doc):\n            opts = DB.DWGExportOptions.GetPredefinedOptions(doc, dwg_setup)\n        else:\n            raise Exception(\"DWG-Setup '{0}' nicht gefunden.\".format(dwg_setup))\n    if opts is None:\n        opts = DB.DWGExportOptions()\n    opts.MergedViews = True\n    return opts\n\n\ndef build_pdf_options(file_name):\n    o = DB.PDFExportOptions()\n    o.Combine = True\n    o.FileName = file_name\n    o.PaperFormat = DB.ExportPaperFormat.Default\n    o.ZoomType = DB.ZoomType.Zoom\n    o.ZoomPercentage = 100\n    o.HideCropBoundaries = True\n    o.HideReferencePlane = True\n    o.HideScopeBoxes = True\n    o.HideUnreferencedViewTags = True\n    o.ViewLinksInBlue = False\n    o.MaskCoincidentLines = False\n    o.ReplaceHalftoneWithThinLines = False\n    o.StopOnError = False\n    return o\n\n\ndef param_path(name):\n    p = doc.ProjectInformation.LookupParameter(name)\n    if p is not None and p.HasValue:\n        v = p.AsString()\n        if v and v.strip():\n            return v.strip().strip('\"')\n    return None\n\n\nclr.AddReference(\"System.Windows.Forms\")\nfrom System.Windows.Forms import SaveFileDialog, DialogResult\n\n\ndef ask_save_path(title, ext, label, default_base):\n    \"\"\"Normales 'Speichern unter'-Fenster. Gibt (ordner, dateiname_ohne_endung) oder None zurueck.\"\"\"\n    dlg = SaveFileDialog()\n    dlg.Title = title\n    dlg.Filter = \"{0} (*.{1})|*.{1}\".format(label, ext)\n    dlg.DefaultExt = ext\n    dlg.AddExtension = True\n    dlg.FileName = default_base + \".\" + ext\n    dlg.OverwritePrompt = False  # Ueberschreiben wird weiter unten separat abgefragt\n    if dlg.ShowDialog() != DialogResult.OK:\n        return None\n    return os.path.dirname(dlg.FileName), os.path.splitext(os.path.basename(dlg.FileName))[0]\n\n\nlog = []\n\npdf_folder = folder_override or None\ndwg_folder = folder_override or None\n\nsheets = []\nfor e in flatten(sheets_in):\n    e = UnwrapElement(e)\n    if isinstance(e, DB.ViewSheet):\n        sheets.append(e)\n    else:\n        log.append(\"Übersprungen (kein Plan): {0}\".format(getattr(e, \"Name\", e)))\n\ndwg_opts = build_dwg_options() if (do_dwg and sheets) else None\n\nplan = [(sh, safe_name(name_tpl.format(Nr=sh.SheetNumber, Name=sh.Name))) for sh in sheets]\n\n# Speicherort per 'Speichern unter'-Fenster waehlen (je Format)\n\ndef choose(ext, label, folder_fixed):\n    if folder_fixed:\n        return folder_fixed\n    if not plan:\n        return None\n    res = ask_save_path(\"Speichern unter - {0}\".format(label), ext, label, plan[0][1])\n    if res is None:\n        log.append(\"{0}-Export abgebrochen (kein Speicherort gewaehlt).\".format(label))\n        return None\n    folder, stem = res\n    if len(plan) == 1:  # einzelner Plan: gewaehlter Dateiname wird uebernommen\n        plan[0] = (plan[0][0], safe_name(stem))\n    return folder\n\n\nif do_pdf:\n    pdf_folder = choose(\"pdf\", \"PDF\", pdf_folder)\n    do_pdf = bool(pdf_folder)\nif do_dwg:\n    dwg_folder = choose(\"dwg\", \"DWG\", dwg_folder)\n    do_dwg = bool(dwg_folder)\n\nfor f in (pdf_folder if do_pdf else None, dwg_folder if do_dwg else None):\n    if f and not os.path.isdir(f):\n        os.makedirs(f)\n\nexisting = []\nfor sh, base in plan:\n    if do_pdf and os.path.isfile(os.path.join(pdf_folder, base + \".pdf\")):\n        existing.append(base + \".pdf\")\n    if do_dwg and os.path.isfile(os.path.join(dwg_folder, base + \".dwg\")):\n        existing.append(base + \".dwg\")\n\nmode = \"replace\"\nif existing:\n    td = UI.TaskDialog(\"Plan-Export\")\n    td.MainInstruction = \"{0} Datei(en) existieren bereits am Speicherort.\".format(len(existing))\n    td.MainContent = \"\\n\".join(existing[:15]) + (\"\\n...\" if len(existing) > 15 else \"\")\n    td.AddCommandLink(UI.TaskDialogCommandLinkId.CommandLink1, \"Archivieren und neu exportieren\",\n                      \"Alte Datei wird nach _alt verschoben (mit Änderungsdatum im Namen).\")\n    td.AddCommandLink(UI.TaskDialogCommandLinkId.CommandLink2, \"Ersetzen\",\n                      \"Vorhandene Dateien werden überschrieben.\")\n    td.AddCommandLink(UI.TaskDialogCommandLinkId.CommandLink3, \"Vorhandene überspringen\",\n                      \"Nur Pläne exportieren, die noch nicht vorhanden sind.\")\n    td.CommonButtons = UI.TaskDialogCommonButtons.Cancel\n    td.DefaultButton = UI.TaskDialogResult.CommandLink1\n    res = td.Show()\n    if res == UI.TaskDialogResult.CommandLink1:\n        mode = \"archive\"\n    elif res == UI.TaskDialogResult.CommandLink2:\n        mode = \"replace\"\n    elif res == UI.TaskDialogResult.CommandLink3:\n        mode = \"skip\"\n    else:\n        mode = \"cancel\"\n        plan = []\n        do_pdf = do_dwg = False\n        log.append(\"Export vom Benutzer abgebrochen.\")\n\n\ndef prepare_target(folder, filename):\n    path = os.path.join(folder, filename)\n    if not os.path.isfile(path):\n        return True\n    if mode == \"skip\":\n        log.append(\"Übersprungen (vorhanden): {0}\".format(filename))\n        return False\n    if mode == \"archive\":\n        try:\n            arch = os.path.join(folder, \"_alt\")\n            if not os.path.isdir(arch):\n                os.makedirs(arch)\n            stamp = datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime(\"%Y%m%d_%H%M%S\")\n            stem, ext = os.path.splitext(filename)\n            dest = os.path.join(arch, \"{0}_{1}{2}\".format(stem, stamp, ext))\n            n = 1\n            while os.path.exists(dest):\n                dest = os.path.join(arch, \"{0}_{1}_{2}{3}\".format(stem, stamp, n, ext))\n                n += 1\n            shutil.move(path, dest)\n            log.append(\"Archiviert: {0}\".format(filename))\n        except Exception as ex:\n            log.append(\"ARCHIVIERUNG FEHLER {0}: {1}\".format(filename, ex))\n            return False\n    return True\n\n\nfor sh, base in plan:\n    ids = List[DB.ElementId]()\n    ids.Add(sh.Id)\n\n    if do_pdf and prepare_target(pdf_folder, base + \".pdf\"):\n        try:\n            ok = doc.Export(pdf_folder, ids, build_pdf_options(base))\n            log.append(\"PDF {0}: {1}\".format(\"OK\" if ok else \"FEHLGESCHLAGEN\", base))\n        except Exception as ex:\n            log.append(\"PDF FEHLER {0}: {1}\".format(base, ex))\n\n    if do_dwg and prepare_target(dwg_folder, base + \".dwg\"):\n        try:\n            ok = doc.Export(dwg_folder, base, ids, dwg_opts)\n            log.append(\"DWG {0}: {1}\".format(\"OK\" if ok else \"FEHLGESCHLAGEN\", base))\n        except Exception as ex:\n            log.append(\"DWG FEHLER {0}: {1}\".format(base, ex))\n\nif do_dwg:\n    geloescht = 0\n    for fn in os.listdir(dwg_folder):\n        if fn.lower().endswith(\".pcp\"):\n            try:\n                os.remove(os.path.join(dwg_folder, fn))\n                geloescht += 1\n            except Exception as ex:\n                log.append(\"PCP nicht löschbar {0}: {1}\".format(fn, ex))\n    log.append(\"{0} .pcp-Datei(en) im DWG-Ordner gelöscht.\".format(geloescht))\n\nlog.append(\"Fertig:{0} Pläne verarbeitet. PDF -> {1} | DWG -> {2}\".format(len(sheets), pdf_folder if do_pdf else \"-\", dwg_folder if do_dwg else \"-\"))\nOUT = log\n",
+      "Engine": "PythonNet3",
+      "VariableInputPorts": true,
+      "Id": "a0000000000000000000000000000001",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "b0000000000000000000000000000000",
+          "Name": "IN[0]",
+          "Description": "Plaene (leer = Revit-Auswahl)",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "b0000000000000000000000000000001",
+          "Name": "IN[1]",
+          "Description": "Zielordner",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "b0000000000000000000000000000002",
+          "Name": "IN[2]",
+          "Description": "PDF exportieren",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "b0000000000000000000000000000003",
+          "Name": "IN[3]",
+          "Description": "DWG exportieren",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "b0000000000000000000000000000004",
+          "Name": "IN[4]",
+          "Description": "DWG-Setup",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "b0000000000000000000000000000005",
+          "Name": "IN[5]",
+          "Description": "Dateiname-Vorlage",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "c0000000000000000000000000000001",
+          "Name": "OUT",
+          "Description": "Ergebnis des Python-Skripts",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Führt ein eingebettetes Python-Skript aus."
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.StringInput, CoreNodeModels",
+      "SerializedWidth": 0.0,
+      "SerializedHeight": 0.0,
+      "Id": "a0000000000000000000000000000011",
+      "NodeType": "StringInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "c0000000000000000000000000000011",
+          "Name": "",
+          "Description": "String",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Erstellt eine Zeichenfolge.",
+      "InputValue": ""
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.BoolSelector, CoreNodeModels",
+      "Id": "a0000000000000000000000000000012",
+      "NodeType": "BooleanInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "c0000000000000000000000000000012",
+          "Name": "",
+          "Description": "Boolean",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Ermöglicht die Auswahl zwischen True und False",
+      "InputValue": true
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.BoolSelector, CoreNodeModels",
+      "Id": "a0000000000000000000000000000013",
+      "NodeType": "BooleanInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "c0000000000000000000000000000013",
+          "Name": "",
+          "Description": "Boolean",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Ermöglicht die Auswahl zwischen True und False",
+      "InputValue": true
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.StringInput, CoreNodeModels",
+      "SerializedWidth": 0.0,
+      "SerializedHeight": 0.0,
+      "Id": "a0000000000000000000000000000014",
+      "NodeType": "StringInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "c0000000000000000000000000000014",
+          "Name": "",
+          "Description": "String",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Erstellt eine Zeichenfolge.",
+      "InputValue": ""
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.StringInput, CoreNodeModels",
+      "SerializedWidth": 0.0,
+      "SerializedHeight": 0.0,
+      "Id": "a0000000000000000000000000000015",
+      "NodeType": "StringInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "c0000000000000000000000000000015",
+          "Name": "",
+          "Description": "String",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Erstellt eine Zeichenfolge.",
+      "InputValue": "{Nr} - {Name}"
+    }
+  ],
+  "Connectors": [
+    {
+      "Start": "c0000000000000000000000000000011",
+      "End": "b0000000000000000000000000000001",
+      "Id": "d0000000000000000000000000000001",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c0000000000000000000000000000012",
+      "End": "b0000000000000000000000000000002",
+      "Id": "d0000000000000000000000000000002",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c0000000000000000000000000000013",
+      "End": "b0000000000000000000000000000003",
+      "Id": "d0000000000000000000000000000003",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c0000000000000000000000000000014",
+      "End": "b0000000000000000000000000000004",
+      "Id": "d0000000000000000000000000000004",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c0000000000000000000000000000015",
+      "End": "b0000000000000000000000000000005",
+      "Id": "d0000000000000000000000000000005",
+      "IsHidden": "False"
+    }
+  ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "EnableLegacyPolyCurveBehavior": false,
+  "Thumbnail": "",
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "Eigenschaften",
+      "Version": "4.1",
+      "Data": {}
+    },
+    {
+      "ExtensionGuid": "DFBD9CC0-DB40-457A-939E-8C8555555A9D",
+      "Name": "Generative Design",
+      "Version": "10.3",
+      "Data": {}
+    }
+  ],
+  "Author": "None provided",
+  "Linting": {
+    "activeLinter": "Keine",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "4.1.1.5050",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Hintergrundvorschau",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "a0000000000000000000000000000001",
+        "Name": "Plan-Export PDF+DWG",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 500.0,
+        "Y": 100.0
+      },
+      {
+        "Id": "a0000000000000000000000000000011",
+        "Name": "Zielordner",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": -103.07582148563768,
+        "Y": -138.08270425434475
+      },
+      {
+        "Id": "a0000000000000000000000000000012",
+        "Name": "PDF exportieren",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 19.44826820483729,
+        "Y": 49.43450266742309
+      },
+      {
+        "Id": "a0000000000000000000000000000013",
+        "Name": "DWG exportieren",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 0.0,
+        "Y": 200.0
+      },
+      {
+        "Id": "a0000000000000000000000000000014",
+        "Name": "DWG-Setup",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 0.0,
+        "Y": 300.0
+      },
+      {
+        "Id": "a0000000000000000000000000000015",
+        "Name": "Dateiname-Vorlage",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 0.0,
+        "Y": 400.0
+      }
+    ],
+    "Annotations": [],
+    "X": 179.6634188890372,
+    "Y": 126.83386938645151,
+    "Zoom": 0.7843693280448271
+  }
+}
