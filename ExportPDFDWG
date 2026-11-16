@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Plan-Export PDF + DWG (Revit 2027 / Dynamo 4.x / CPython3)
 # IN[0] Plaene (nicht verbunden = in Revit markierte Plaene)
-# IN[1] Zielordner-Override (leer = Projektparameter 'Planspeicherort - PDF' / '- DWG') | IN[2] PDF (bool) | IN[3] DWG (bool)
+# IN[1] Zielordner-Override (leer = 'Speichern unter'-Fenster zur freien Wahl des Speicherorts) | IN[2] PDF (bool) | IN[3] DWG (bool)
 # IN[4] DWG-Setup-Name (leer = Standard) | IN[5] Dateiname-Vorlage {Nr} {Name}
 import clr
 import os
@@ -83,21 +83,28 @@ def param_path(name):
     return None
 
 
+clr.AddReference("System.Windows.Forms")
+from System.Windows.Forms import SaveFileDialog, DialogResult
+
+
+def ask_save_path(title, ext, label, default_base):
+    """Normales 'Speichern unter'-Fenster. Gibt (ordner, dateiname_ohne_endung) oder None zurueck."""
+    dlg = SaveFileDialog()
+    dlg.Title = title
+    dlg.Filter = "{0} (*.{1})|*.{1}".format(label, ext)
+    dlg.DefaultExt = ext
+    dlg.AddExtension = True
+    dlg.FileName = default_base + "." + ext
+    dlg.OverwritePrompt = False  # Ueberschreiben wird weiter unten separat abgefragt
+    if dlg.ShowDialog() != DialogResult.OK:
+        return None
+    return os.path.dirname(dlg.FileName), os.path.splitext(os.path.basename(dlg.FileName))[0]
+
+
 log = []
 
-pdf_folder = folder_override or param_path("Planspeicherort - PDF")
-dwg_folder = folder_override or param_path("Planspeicherort - DWG")
-
-if do_pdf and not pdf_folder:
-    log.append("FEHLER: Projektparameter 'Planspeicherort - PDF' fehlt oder ist leer - PDF-Export übersprungen.")
-    do_pdf = False
-if do_dwg and not dwg_folder:
-    log.append("FEHLER: Projektparameter 'Planspeicherort - DWG' fehlt oder ist leer - DWG-Export übersprungen.")
-    do_dwg = False
-
-for f in (pdf_folder if do_pdf else None, dwg_folder if do_dwg else None):
-    if f and not os.path.isdir(f):
-        os.makedirs(f)
+pdf_folder = folder_override or None
+dwg_folder = folder_override or None
 
 sheets = []
 for e in flatten(sheets_in):
@@ -110,6 +117,34 @@ for e in flatten(sheets_in):
 dwg_opts = build_dwg_options() if (do_dwg and sheets) else None
 
 plan = [(sh, safe_name(name_tpl.format(Nr=sh.SheetNumber, Name=sh.Name))) for sh in sheets]
+
+# Speicherort per 'Speichern unter'-Fenster waehlen (je Format)
+
+def choose(ext, label, folder_fixed):
+    if folder_fixed:
+        return folder_fixed
+    if not plan:
+        return None
+    res = ask_save_path("Speichern unter - {0}".format(label), ext, label, plan[0][1])
+    if res is None:
+        log.append("{0}-Export abgebrochen (kein Speicherort gewaehlt).".format(label))
+        return None
+    folder, stem = res
+    if len(plan) == 1:  # einzelner Plan: gewaehlter Dateiname wird uebernommen
+        plan[0] = (plan[0][0], safe_name(stem))
+    return folder
+
+
+if do_pdf:
+    pdf_folder = choose("pdf", "PDF", pdf_folder)
+    do_pdf = bool(pdf_folder)
+if do_dwg:
+    dwg_folder = choose("dwg", "DWG", dwg_folder)
+    do_dwg = bool(dwg_folder)
+
+for f in (pdf_folder if do_pdf else None, dwg_folder if do_dwg else None):
+    if f and not os.path.isdir(f):
+        os.makedirs(f)
 
 existing = []
 for sh, base in plan:
